@@ -62,24 +62,41 @@ def _shift_months(dt: datetime, months: int) -> datetime:
     return dt.replace(year=year, month=month, day=day)
 
 
-def _predict_next_month(history: List[MonthlyExpense]) -> float:
-    """Project next month using a simple trend extrapolation."""
-    if len(history) >= 2:
-        last = history[-1].total
-        prev = history[-2].total
-        change = last - prev
-        projected = last + 0.5 * change  # dampened trend for stability
-        return max(projected, 0.0)
-    if history:
-        return max(history[-1].total, 0.0)
-    return 0.0
+# -----------------------------------------------------------
+# NEW: Weighted Moving Average-based prediction function
+# -----------------------------------------------------------
 
+def _predict_next_month(history: List[MonthlyExpense]) -> float:
+    """Predict next month's expense using Weighted Moving Average (WMA)."""
+    totals = [h.total for h in history]
+
+    # Only one month → Just repeat last month
+    if len(totals) == 1:
+        return round(totals[-1], 2)
+
+    # Two months → Slight smoothing
+    if len(totals) == 2:
+        last, prev = totals[-1], totals[-2]
+        prediction = last * 0.7 + prev * 0.3
+        return round(prediction, 2)
+
+    # Three or more months → Use 3-month WMA (0.5, 0.3, 0.2)
+    last3 = totals[-3:]
+    weights = [0.2, 0.3, 0.5]  # oldest → newest
+    prediction = sum(v * w for v, w in zip(last3, weights))
+
+    return round(prediction, 2)
+
+
+# -----------------------------------------------------------
+# EXPENSE PREDICTION ENDPOINT
+# -----------------------------------------------------------
 
 @app.get("/users/{user_id}/expense-prediction", response_model=PredictionResponse)
 def predict_expense(user_id: str) -> PredictionResponse:
     try:
         user_object_id = ObjectId(user_id)
-    except Exception as exc:  # pragma: no cover - fastapi handles validation
+    except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid user id") from exc
 
     now = datetime.now(timezone.utc)
@@ -127,7 +144,9 @@ def predict_expense(user_id: str) -> PredictionResponse:
 
     results = list(mongo.transactions.aggregate(pipeline))
 
-    grouped: Dict[ObjectId, Dict[str, List[MonthlyExpense]]] = defaultdict(lambda: {"history": []})
+    grouped: Dict[ObjectId, Dict[str, List[MonthlyExpense]]] = defaultdict(
+        lambda: {"history": []}
+    )
 
     for item in results:
         head_category_id: ObjectId = item["_id"]["headCategory"]
@@ -144,7 +163,8 @@ def predict_expense(user_id: str) -> PredictionResponse:
     categories: List[CategoryPrediction] = []
     for head_category_id, record in grouped.items():
         history = sorted(record["history"], key=lambda doc: (doc.year, doc.month))
-        predicted_total = round(_predict_next_month(history), 2)
+        predicted_total = _predict_next_month(history)
+
         categories.append(
             CategoryPrediction(
                 headCategoryId=str(head_category_id),
